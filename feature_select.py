@@ -145,8 +145,8 @@ def evaluate_ic(X, y, groups, n_splits=5, n_jobs=-1):
             subsample=0.7,
         )
         model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        return pd.Series(preds).corr(y_test, method="spearman")
+        preds = pd.Series(model.predict(X_test), index=y_test.index)
+        return preds.corr(y_test, method="spearman")
 
     scores = Parallel(n_jobs=n_jobs)(
         delayed(_score)(tr, te) for tr, te in gkf.split(X, y, groups)
