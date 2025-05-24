@@ -5,14 +5,19 @@ from pathlib import Path
 
 from sklearn.model_selection import GroupKFold
 from sklearn.feature_selection import mutual_info_regression
+from joblib import Parallel, delayed
+
+from skrebate import ReliefF
+import shap
 
 import lightgbm as lgb
 
-# Patch BorutaShap for SciPy>=1.11
+# Patch BorutaShapPlus for SciPy>=1.11
 import scipy.stats
-if not hasattr(scipy.stats, 'binom_test'):
+
+if not hasattr(scipy.stats, "binom_test"):
     scipy.stats.binom_test = scipy.stats.binomtest
-from BorutaShap import BorutaShap
+from BorutaShapPlus import BorutaShap
 
 from pyHSICLasso import HSICLasso
 
@@ -43,7 +48,11 @@ def prepare_panel(csv_path: str):
 
     # 20-day rolling volatility using past data only
     df["vol20"] = (
-        df.groupby(level=0)["ret"].rolling(20, min_periods=20).std().shift(1).droplevel(0)
+        df.groupby(level=0)["ret"]
+        .rolling(20, min_periods=20)
+        .std()
+        .shift(1)
+        .droplevel(0)
     )
 
     df["zadj"] = (
@@ -70,25 +79,38 @@ def prepare_panel(csv_path: str):
     return X, y, groups
 
 
-def select_features(X, y, k=150, hsic_m=1000):
-    """Three-stage feature selector with fallbacks."""
-    try:
-        import pymrmr
+def select_features(X, y, k=150, hsic_m=1000, relief_k=100):
+    """Multi-stage feature selector using mrmr-selection, skrebate, HSIC Lasso and BorutaShapPlus."""
 
-        df_mrmr = pd.concat([y.rename("target"), X], axis=1).reset_index(drop=True)
-        top = pymrmr.mRMR(df_mrmr, "MIQ", k)
+    # mRMR filter
+    try:
+        from mrmr import mrmr_regression
+
+        top = mrmr_regression(X=X, y=y, K=k)
     except Exception:
         mi = mutual_info_regression(X, y)
         order = np.argsort(mi)[::-1][:k]
         top = X.columns[order].tolist()
     X1 = X[top]
 
+    # ReliefF refinement
+    try:
+        n_select = min(relief_k, X1.shape[1])
+        relief = ReliefF(n_neighbors=100, n_features_to_select=n_select)
+        relief.fit(X1.values, y.values)
+        order = np.argsort(relief.feature_importances_)[::-1][:n_select]
+        X1 = X1.iloc[:, order]
+    except Exception:
+        pass
+
+    # HSIC Lasso
     hsic = HSICLasso()
     hsic.input(X1.values, y.values, M=hsic_m)
     hsic.run()
     hsic_cols = X1.columns[hsic.get_index()]
     X2 = X1[hsic_cols]
 
+    # BorutaShapPlus wrapper around LightGBM
     ranker = lgb.LGBMRegressor(
         objective="regression",
         n_estimators=200,
@@ -108,11 +130,11 @@ def select_features(X, y, k=150, hsic_m=1000):
     return list(final_cols)
 
 
-def evaluate_ic(X, y, groups, n_splits=5):
+def evaluate_ic(X, y, groups, n_splits=5, n_jobs=-1):
     """Return mean IC across GroupKFold splits."""
     gkf = GroupKFold(n_splits=n_splits)
-    scores = []
-    for train_idx, test_idx in gkf.split(X, y, groups):
+
+    def _score(train_idx, test_idx):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         model = lgb.LGBMRegressor(
@@ -124,8 +146,11 @@ def evaluate_ic(X, y, groups, n_splits=5):
         )
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
-        score = pd.Series(preds).corr(y_test, method="spearman")
-        scores.append(score)
+        return pd.Series(preds).corr(y_test, method="spearman")
+
+    scores = Parallel(n_jobs=n_jobs)(
+        delayed(_score)(tr, te) for tr, te in gkf.split(X, y, groups)
+    )
     return float(np.nanmean(scores))
 
 
@@ -134,7 +159,9 @@ def main():
 
     p = argparse.ArgumentParser(description="Feature selection and IC test")
     p.add_argument("csv", help="Path to CSV file with data")
-    p.add_argument("--out", default="selected_features.json", help="Where to save features")
+    p.add_argument(
+        "--out", default="selected_features.json", help="Where to save features"
+    )
     args = p.parse_args()
 
     X, y, groups = prepare_panel(args.csv)
@@ -147,6 +174,21 @@ def main():
 
     ic_sel = evaluate_ic(X[feats], y, groups)
     print(f"After selection mean IC: {ic_sel:.4f}")
+
+    model = lgb.LGBMRegressor(
+        objective="regression",
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.7,
+    )
+    model.fit(X[feats], y)
+    explainer = shap.TreeExplainer(model)
+    shap_vals = explainer.shap_values(X[feats])
+    shap_imp = np.abs(shap_vals).mean(axis=0)
+    order = np.argsort(shap_imp)[::-1][:10]
+    top_shap = [feats[i] for i in order]
+    print("Top SHAP features:", top_shap)
 
 
 if __name__ == "__main__":
