@@ -17,7 +17,7 @@ import scipy.stats
 
 if not hasattr(scipy.stats, "binom_test"):
     scipy.stats.binom_test = scipy.stats.binomtest
-from BorutaShapPlus import BorutaShap
+from BorutaShap import BorutaShap
 
 from pyHSICLasso import HSICLasso
 
